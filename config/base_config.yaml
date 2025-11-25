@@ -16,6 +16,14 @@ construction:
     enable_fast_mode: true
     struct_weight: 0.3
     max_total_communities: 100
+
+multimodal:
+  enabled: false
+  caption_model: heuristic
+  max_assets_per_page: 6
+  table_format: markdown
+  persist_raw_assets: true
+  asset_base_dir: data/uploaded
     
 datasets:
   hotpot:

@@ -204,6 +204,14 @@ python main.py --override '{
 }' --datasets demo
 ```
 
+## 🧮 Multimodal MinerU Workflow
+
+- **Enablement:** Set `multimodal.enabled: true` under `config/base_config.yaml` or pass `--enable-multimodal` to `python main.py` for ad-hoc runs. The backend shares the same setting, so uploads automatically reuse it.
+- **Extraction:** When enabled, MinerU/PyMuPDF parses every PDF/DOC(X) page into text spans, markdown-ready tables, LaTeX formulas, and captioned figures (inspired by the RAG-Anything strategy). All artifacts are persisted under `data/uploaded/<dataset>/multimodal/`.
+- **Graph integration:** The stored manifest also contains “virtual documents” (pseudo paragraphs) derived from the multimodal assets. They are appended to the normal corpus before graph construction—no changes are required inside the constructor.
+- **Inspection:** Use `GET /api/multimodal/<dataset>` to inspect the manifest or verify that captions/tables look correct before triggering construction.
+- **Safety:** Leave `multimodal.enabled` as `false` if you only need text parsing. The ingestion path and graph builder will behave exactly as before.
+
 </details>
 
 ### 📊 Performance Optimization Recommendations

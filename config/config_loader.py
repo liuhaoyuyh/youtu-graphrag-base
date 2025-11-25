@@ -126,6 +126,16 @@ class EvaluationConfig:
         if self.metrics is None:
             self.metrics = ["accuracy", "precision", "recall", "f1"]
 
+@dataclass
+class MultimodalConfig:
+    """Multimodal ingestion configuration."""
+    enabled: bool = False
+    caption_model: str = "heuristic"
+    max_assets_per_page: int = 10
+    table_format: str = "markdown"
+    persist_raw_assets: bool = True
+    asset_base_dir: str = "data/uploaded"
+
 class ConfigManager:
     """
     Main configuration manager for the KT-RAG framework.
@@ -152,6 +162,7 @@ class ConfigManager:
         self.output: Optional[OutputConfig] = None
         self.performance: Optional[PerformanceConfig] = None
         self.evaluation: Optional[EvaluationConfig] = None
+        self.multimodal: Optional[MultimodalConfig] = None
 
         self.load_config()
     
@@ -217,6 +228,9 @@ class ConfigManager:
         
         evaluation_data = self.config_data.get("evaluation", {})
         self.evaluation = EvaluationConfig(**evaluation_data)
+
+        multimodal_data = self.config_data.get("multimodal", {})
+        self.multimodal = MultimodalConfig(**multimodal_data)
     
     def _validate_config(self) -> None:
         """Validate the loaded configuration."""
@@ -239,6 +253,10 @@ class ConfigManager:
         
         if self.tree_comm.struct_weight < 0 or self.tree_comm.struct_weight > 1:
             raise ValueError("struct_weight must be between 0 and 1")
+        
+        if self.multimodal and self.multimodal.max_assets_per_page is not None:
+            if self.multimodal.max_assets_per_page < 0:
+                raise ValueError("multimodal.max_assets_per_page must be non-negative")
     
     def get_dataset_config(self, dataset_name: str) -> DatasetConfig:
         """Get configuration for a specific dataset."""
@@ -293,6 +311,7 @@ class ConfigManager:
             "output": asdict(self.output),
             "performance": asdict(self.performance),
             "evaluation": asdict(self.evaluation),
+            "multimodal": asdict(self.multimodal) if self.multimodal else None,
         }
     
     def create_output_directories(self) -> None:

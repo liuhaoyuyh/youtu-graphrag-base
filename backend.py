@@ -26,6 +26,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from utils.logger import logger
+from utils.multimodal import MultimodalAssetStore
 import ast
 
 # Import document parser
@@ -66,6 +67,13 @@ app.add_middleware(
 # Global variables
 active_connections: Dict[str, WebSocket] = {}
 config = None
+
+def get_runtime_config():
+    """Ensure a ConfigManager instance exists."""
+    global config
+    if config is None:
+        config = get_config("config/base_config.yaml")
+    return config
 
 class ConnectionManager:
     def __init__(self):
@@ -293,6 +301,10 @@ async def upload_files(files: List[UploadFile] = File(...), client_id: str = "de
             
         upload_dir = f"data/uploaded/{dataset_name}"
         os.makedirs(upload_dir, exist_ok=True)
+        runtime_config = get_runtime_config()
+        multimodal_cfg = getattr(runtime_config, "multimodal", None)
+        multimodal_enabled = bool(multimodal_cfg and multimodal_cfg.enabled)
+        asset_store = MultimodalAssetStore(dataset_name, dataset_dir=upload_dir, config=multimodal_cfg) if multimodal_enabled else None
         
         await send_progress_update(client_id, "upload", 10, "Starting file upload...")
         
@@ -334,14 +346,33 @@ async def upload_files(files: List[UploadFile] = File(...), client_id: str = "de
                     continue
                 
                 try:
-                    text = doc_parser.parse_file(file_path, ext)
+                    if multimodal_enabled and hasattr(doc_parser, "parse_file_with_multimodal"):
+                        text, structured_payload = doc_parser.parse_file_with_multimodal(file_path, ext)
+                    else:
+                        text = doc_parser.parse_file(file_path, ext)
+                        structured_payload = None
+
                     if text and text.strip():
-                        corpus_data.append({
+                        corpus_entry = {
                             "title": file.filename,
                             "text": text
-                        })
+                        }
+                        corpus_data.append(corpus_entry)
                         processed_count += 1
-                        await send_progress_update(client_id, "upload", 10 + (i + 1) * 80 // len(files), f"Parsed {file.filename}")
+
+                        extra_docs = []
+                        if multimodal_enabled and asset_store and structured_payload:
+                            try:
+                                extra_docs = asset_store.persist_payload(structured_payload)
+                            except Exception as asset_err:
+                                logger.warning(f"Failed to persist multimodal assets for {file.filename}: {asset_err}")
+                            if extra_docs:
+                                corpus_data.extend(extra_docs)
+
+                        progress_msg = f"Parsed {file.filename}"
+                        if extra_docs:
+                            progress_msg += f" (+{len(extra_docs)} multimodal chunks)"
+                        await send_progress_update(client_id, "upload", 10 + (i + 1) * 80 // len(files), progress_msg)
                     else:
                         logger.warning(f"No text extracted from {file.filename}")
                         skipped_files.append(file.filename)
@@ -447,16 +478,14 @@ async def construct_graph(request: GraphConstructionRequest, client_id: str = "d
         await send_progress_update(client_id, "construction", 10, "Loading configuration and corpus...")
         
         # Initialize config
-        global config
-        if config is None:
-            config = get_config("config/base_config.yaml")
+        runtime_config = get_runtime_config()
         
         # Initialize KTBuilder
         builder = constructor.KTBuilder(
             dataset_name,
             schema_path,
-            mode=config.construction.mode,
-            config=config
+            mode=runtime_config.construction.mode,
+            config=runtime_config
         )
         
         await send_progress_update(client_id, "construction", 20, "Starting entity-relation extraction...")
@@ -530,6 +559,49 @@ async def prepare_graph_visualization(graph_path: str) -> Dict:
     except Exception as e:
         logger.error(f"Error preparing visualization: {e}")
         return {"nodes": [], "links": [], "categories": [], "stats": {}}
+
+
+@app.get("/api/multimodal/{dataset_name}")
+async def get_multimodal_assets(dataset_name: str):
+    """Inspect stored multimodal assets for a dataset."""
+    cfg = getattr(get_runtime_config(), "multimodal", None)
+    if not cfg or not cfg.enabled:
+        return {
+            "success": True,
+            "enabled": False,
+            "dataset": dataset_name,
+            "assets": [],
+            "virtual_documents": [],
+        }
+    
+    candidate_dirs = [
+        os.path.join("data", "uploaded", dataset_name),
+        os.path.join("data", dataset_name),
+    ]
+    store = None
+    for candidate in candidate_dirs:
+        if os.path.exists(candidate):
+            store = MultimodalAssetStore(dataset_name, dataset_dir=candidate, config=cfg)
+            break
+    if not store:
+        return {
+            "success": False,
+            "enabled": True,
+            "dataset": dataset_name,
+            "assets": [],
+            "virtual_documents": [],
+            "message": "Dataset directory not found",
+        }
+    
+    manifest = store.list_assets()
+    virtual_docs = store.load_virtual_documents()
+    return {
+        "success": True,
+        "enabled": True,
+        "dataset": dataset_name,
+        "assets": manifest.get("assets", []),
+        "virtual_documents": virtual_docs,
+    }
 
 def convert_graphrag_format(graph_data: List) -> Dict:
     """Convert GraphRAG relationship list to ECharts format"""

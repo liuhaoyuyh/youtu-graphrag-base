@@ -4,11 +4,15 @@ Supports parsing PDF, DOCX, DOC files using MinerU and python-docx
 """
 
 import os
+import re
 import tempfile
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 
 from utils.logger import logger
+
+FORMULA_HINT_CHARS = set("=±×÷∑∏√∞πσΔΩμθλκ^_{}<>≠≥≤")
+TABLE_DELIMITERS = ("|", "\t")
 
 try:
     from magic_pdf.data.dataset import PymuDocDataset
@@ -77,18 +81,20 @@ class DocumentParser:
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="youtu_graphrag_")
         logger.info(f"DocumentParser initialized with temp dir: {self.temp_dir}")
+        self.supports_multimodal = MINERU_AVAILABLE or PYMUPDF_AVAILABLE
     
     def parse_file(self, file_path: str, file_type: str) -> Optional[str]:
+        """Parse a document file and extract plain text content."""
+        text, _ = self._parse_with_multimodal(file_path, file_type)
+        return text
+    
+    def parse_file_with_multimodal(self, file_path: str, file_type: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """
-        Parse a document file and extract text content
-        
-        Args:
-            file_path: Path to the document file
-            file_type: File extension (.pdf, .docx, .doc)
-            
-        Returns:
-            Extracted text content or None if parsing fails
+        Parse a file and return both plain text and structured multimodal payload.
         """
+        return self._parse_with_multimodal(file_path, file_type)
+
+    def _parse_with_multimodal(self, file_path: str, file_type: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         file_type = file_type.lower()
         
         try:
@@ -96,110 +102,87 @@ class DocumentParser:
                 return self._parse_pdf(file_path)
             elif file_type in ['.docx', '.doc']:
                 return self._parse_docx(file_path)
+            elif file_type in ['.txt', '.md']:
+                text = self._parse_plain_text(file_path)
+                payload = self._build_text_payload(file_path, text) if text else None
+                return text, payload
             else:
-                logger.warning(f"Unsupported file type: {file_type}")
-                return None
+                logger.warning(f"Unsupported file type for multimodal parsing: {file_type}")
+                return None, None
         except Exception as e:
             logger.error(f"Error parsing {file_type} file: {e}")
-            return None
+            return None, None
     
-    def _parse_pdf(self, pdf_path: str) -> Optional[str]:
+    def _parse_pdf(self, pdf_path: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """
-        Parse PDF using MinerU
-        
-        Args:
-            pdf_path: Path to PDF file
-            
-        Returns:
-            Extracted text content
+        Parse PDF using MinerU (if available) with PyMuPDF fallbacks.
+        Returns both text and structured payload.
         """
-        if not MINERU_AVAILABLE:
-            logger.error("MinerU is not installed. Cannot parse PDF files.")
-            return None
+        payload = self._init_payload(pdf_path)
+        text_parts: List[str] = []
         
         try:
             with open(pdf_path, 'rb') as f:
                 pdf_bytes = f.read()
         except Exception as e:
             logger.error(f"Unable to read PDF file {pdf_path}: {e}")
-            return None
+            return None, None
 
-        # -------- MinerU / PyMuPDF pipeline --------
         if MINERU_AVAILABLE:
             try:
                 dataset = PymuDocDataset(pdf_bytes, lang='auto')
-                text_parts: list[str] = []
                 for page_index in range(len(dataset)):
-                    try:
-                        page_doc = dataset.get_page(page_index).get_doc()
-                        page_text = page_doc.get_text("text")
-                        if page_text:
-                            text_parts.append(page_text.strip())
-                    except Exception as page_err:
-                        logger.warning(
-                            f"MinerU pipeline failed to extract page {page_index} of {pdf_path}: {page_err}"
-                        )
-                        continue
-
-                if text_parts:
-                    extracted_text = '\n\n'.join(text_parts)
-                    logger.info(
-                        f"Successfully extracted {len(extracted_text)} chars from PDF via MinerU pipeline"
-                    )
-                    return extracted_text
+                    page_doc = dataset.get_page(page_index).get_doc()
+                    page_payload = self._ensure_page_payload(payload, page_index + 1)
+                    page_text = self._extract_page_blocks(page_doc, page_payload)
+                    if page_text:
+                        text_parts.append(page_text)
             except Exception as e:
-                logger.warning(f"MinerU PDF parsing failed: {e}")
+                logger.warning(f"MinerU structured extraction failed: {e}")
+                payload = self._init_payload(pdf_path)
+                text_parts = []
 
-        # -------- Direct PyMuPDF fallback --------
-        if PYMUPDF_AVAILABLE:
+        if not text_parts and PYMUPDF_AVAILABLE:
             try:
-                text_parts: list[str] = []
                 with fitz.open(pdf_path) as doc:  # type: ignore[attr-defined]
                     for page in doc:
-                        page_text = page.get_text("text")
+                        page_payload = self._ensure_page_payload(payload, page.number + 1)
+                        page_text = self._extract_page_blocks(page, page_payload)
                         if page_text:
-                            text_parts.append(page_text.strip())
-                if text_parts:
-                    extracted_text = '\n\n'.join(text_parts)
-                    logger.info(
-                        f"Successfully extracted {len(extracted_text)} chars from PDF via PyMuPDF fallback"
-                    )
-                    return extracted_text
+                            text_parts.append(page_text)
             except Exception as e:
-                logger.error(f"PyMuPDF fallback failed: {e}")
+                logger.error(f"PyMuPDF extraction failed: {e}")
 
-        # -------- PyPDF fallback --------
-        try:
-            from pypdf import PdfReader  # type: ignore
+        if not text_parts:
+            try:
+                from pypdf import PdfReader  # type: ignore
+                reader = PdfReader(pdf_path)
+                for page_index, page in enumerate(reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                    except Exception as page_err:
+                        logger.warning(
+                            f"pypdf failed to extract page {page_index} of {pdf_path}: {page_err}"
+                        )
+                        continue
+                    if page_text:
+                        text_parts.append(page_text.strip())
+                if text_parts and not payload.get("pages"):
+                    payload = self._build_text_payload(pdf_path, "\n\n".join(text_parts))
+            except ImportError:
+                logger.debug("pypdf not installed; skipping pypdf fallback")
+            except Exception as e:
+                logger.error(f"pypdf fallback failed: {e}")
 
-            reader = PdfReader(pdf_path)
-            text_parts = []
-            for page_index, page in enumerate(reader.pages):
-                try:
-                    page_text = page.extract_text()
-                except Exception as page_err:
-                    logger.warning(
-                        f"pypdf failed to extract page {page_index} of {pdf_path}: {page_err}"
-                    )
-                    continue
-                if page_text:
-                    text_parts.append(page_text.strip())
-
-            if text_parts:
-                extracted_text = '\n\n'.join(text_parts)
-                logger.info(
-                    f"Successfully extracted {len(extracted_text)} chars from PDF via pypdf fallback"
-                )
-                return extracted_text
-        except ImportError:
-            logger.debug("pypdf not installed; skipping pypdf fallback")
-        except Exception as e:
-            logger.error(f"pypdf fallback failed: {e}")
-
-        logger.error(f"Unable to extract text from PDF: {pdf_path}")
-        return None
+        if not text_parts:
+            logger.error(f"Unable to extract text from PDF: {pdf_path}")
+            return None, None
+        
+        extracted_text = '\n\n'.join(text_parts)
+        logger.info(f"Successfully extracted {len(extracted_text)} chars from PDF")
+        return extracted_text, self._finalize_payload(payload)
     
-    def _parse_docx(self, docx_path: str) -> Optional[str]:
+    def _parse_docx(self, docx_path: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """
         Parse DOCX/DOC using available methods
         
@@ -216,13 +199,13 @@ class DocumentParser:
             logger.info(f"Detected RTF file disguised as {file_ext}: {docx_path}")
             result = self._parse_rtf(docx_path)
             if result:
-                return result
+                return result, self._build_text_payload(docx_path, result)
         
         # Try python-docx first for .docx files
         if file_ext == '.docx' and DOCX_AVAILABLE:
             result = self._parse_with_python_docx(docx_path)
             if result:
-                return result
+                return result, self._build_text_payload(docx_path, result)
         
         # For .doc files or if python-docx fails, try alternative methods
         if file_ext == '.doc':
@@ -231,28 +214,28 @@ class DocumentParser:
                 result = self._parse_with_antiword(docx_path)
                 if result:
                     logger.info(f"Successfully extracted {len(result)} chars from DOC via antiword")
-                    return result
+                    return result, self._build_text_payload(docx_path, result)
             
             # Priority 2: Try Apache Tika (best for WPS and complex formats)
             if TIKA_AVAILABLE:
                 result = self._parse_with_tika(docx_path)
                 if result:
                     logger.info(f"Successfully extracted {len(result)} chars from DOC via Apache Tika")
-                    return result
+                    return result, self._build_text_payload(docx_path, result)
             
             # Priority 3: Try textract (if available, but has pip 24.1+ conflicts)
             if TEXTRACT_AVAILABLE:
                 result = self._parse_with_textract(docx_path)
                 if result:
                     logger.info(f"Successfully extracted {len(result)} chars from DOC via textract")
-                    return result
+                    return result, self._build_text_payload(docx_path, result)
             
             # Priority 4: Try LibreOffice conversion (best for WPS/legacy formats)
             logger.debug(f"Trying LibreOffice for .doc file: {docx_path}")
             result = self._parse_doc_with_libreoffice(docx_path)
             if result:
                 logger.info(f"Successfully extracted {len(result)} chars from DOC via LibreOffice")
-                return result
+                return result, self._build_text_payload(docx_path, result)
             else:
                 logger.debug(f"LibreOffice parsing returned None for: {docx_path}")
         
@@ -260,7 +243,7 @@ class DocumentParser:
         if DOCX_AVAILABLE:
             result = self._parse_with_python_docx(docx_path)
             if result:
-                return result
+                return result, self._build_text_payload(docx_path, result)
         
         # Check file type to provide better error message
         file_type_hint = ""
@@ -294,7 +277,7 @@ class DocumentParser:
             logger.info("  1. Install LibreOffice (best compatibility): sudo yum install libreoffice-headless")
             logger.info("  2. Convert file to .docx format using Microsoft Word or WPS")
             logger.info("  3. For standard .doc files: Install antiword (sudo apt-get install antiword)")
-        return None
+        return None, None
     
     def _parse_with_python_docx(self, docx_path: str) -> Optional[str]:
         """Parse using python-docx library"""
@@ -341,6 +324,171 @@ class DocumentParser:
         except Exception as e:
             logger.debug(f"textract failed: {e}")
         return None
+
+    # -------------------- Multimodal helpers -------------------- #
+    def _parse_plain_text(self, file_path: str) -> Optional[str]:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f"Failed to read plain text file {file_path}: {e}")
+            return None
+
+    def _init_payload(self, source_path: str) -> Dict[str, Any]:
+        return {
+            "source_file": os.path.basename(source_path),
+            "pages": []
+        }
+
+    def _ensure_page_payload(self, payload: Dict[str, Any], page_number: int) -> Dict[str, Any]:
+        for page in payload["pages"]:
+            if page["page_number"] == page_number:
+                return page
+        page_payload = {
+            "page_number": page_number,
+            "text_spans": [],
+            "tables": [],
+            "formulas": [],
+            "images": []
+        }
+        payload["pages"].append(page_payload)
+        return page_payload
+
+    def _finalize_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not payload["pages"]:
+            return None
+        for page in payload["pages"]:
+            if any(page[key] for key in ("text_spans", "tables", "formulas", "images")):
+                return payload
+        return None
+
+    def _extract_page_blocks(self, page_doc, page_payload: Dict[str, Any]) -> Optional[str]:
+        page_text_parts: List[str] = []
+        try:
+            blocks = page_doc.get_text("blocks")
+        except Exception as e:
+            logger.debug(f"Failed to read page blocks: {e}")
+            blocks = []
+
+        for block in blocks:
+            if not isinstance(block, (list, tuple)) or len(block) < 5:
+                continue
+            x0, y0, x1, y1, text = block[:5]
+            cleaned = str(text).strip()
+            if not cleaned:
+                continue
+            entry = {"text": cleaned, "bbox": [float(x0), float(y0), float(x1), float(y1)]}
+            if self._looks_like_table(cleaned):
+                page_payload["tables"].append(entry)
+            elif self._looks_like_formula(cleaned):
+                page_payload["formulas"].append(entry)
+            else:
+                page_payload["text_spans"].append(entry)
+            page_text_parts.append(cleaned)
+
+        page_payload["images"].extend(self._extract_images_from_page(page_doc))
+        return "\n".join(page_text_parts) if page_text_parts else None
+
+    def _extract_images_from_page(self, page_doc) -> List[Dict[str, Any]]:
+        images: List[Dict[str, Any]] = []
+        if not PYMUPDF_AVAILABLE:
+            return images
+        try:
+            for img in page_doc.get_images(full=True):
+                xref = img[0]
+                bbox = None
+                rects = []
+                for rect in page_doc.get_image_rects(xref):
+                    rects.append(self._normalize_bbox(rect))
+                if rects:
+                    bbox = rects[0]
+                img_bytes = None
+                ext = None
+                try:
+                    base_image = page_doc.parent.extract_image(xref)
+                    img_bytes = base_image.get("image")
+                    ext = base_image.get("ext")
+                except Exception as e:
+                    logger.debug(f"Failed to extract image bytes for xref {xref}: {e}")
+                images.append({
+                    "bbox": bbox,
+                    "bytes": img_bytes,
+                    "ext": ext,
+                    "caption_candidates": self._caption_from_rect(page_doc, bbox)
+                })
+        except Exception as e:
+            logger.debug(f"Failed to extract images on page: {e}")
+        return images
+
+    def _normalize_bbox(self, rect) -> Optional[List[float]]:
+        if rect is None:
+            return None
+        if hasattr(rect, "x0"):
+            return [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+        if isinstance(rect, (list, tuple)) and len(rect) >= 4:
+            return [float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])]
+        return None
+
+    def _caption_from_rect(self, page_doc, bbox: Optional[List[float]]) -> List[str]:
+        if not bbox:
+            return []
+        try:
+            blocks = page_doc.get_text("blocks")
+        except Exception:
+            return []
+        captions: List[str] = []
+        x0, y0, x1, y1 = bbox
+        for block in blocks:
+            if not isinstance(block, (list, tuple)) or len(block) < 5:
+                continue
+            bx0, by0, bx1, by1, text = block[:5]
+            snippet = str(text).strip()
+            if not snippet:
+                continue
+            horizontal_overlap = not (bx1 < x0 or bx0 > x1)
+            vertical_distance = min(abs(by0 - y1), abs(y0 - by1))
+            if horizontal_overlap and vertical_distance < 60:
+                captions.append(snippet)
+            if len(captions) >= 2:
+                break
+        return captions
+
+    def _looks_like_table(self, text: str) -> bool:
+        lines = [line for line in text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return False
+        delimiter_hits = sum(1 for line in lines if any(delim in line for delim in TABLE_DELIMITERS))
+        numeric_lines = sum(1 for line in lines if sum(ch.isdigit() for ch in line) >= 4)
+        if delimiter_hits >= max(1, len(lines) // 2):
+            return True
+        return numeric_lines >= 2 and len(lines[0].split()) >= 3
+
+    def _looks_like_formula(self, text: str) -> bool:
+        if len(text) > 400:
+            return False
+        if any(ch in FORMULA_HINT_CHARS for ch in text):
+            return True
+        if re.search(r"[A-Za-z]\\s*=\\s*[0-9A-Za-z]", text):
+            return True
+        if "\\" in text and ("frac" in text or "sum" in text):
+            return True
+        return False
+
+    def _build_text_payload(self, source_path: str, text: str) -> Optional[Dict[str, Any]]:
+        payload = self._init_payload(source_path)
+        page_payload = self._ensure_page_payload(payload, 1)
+        for paragraph in re.split(r"\n{2,}", text):
+            cleaned = paragraph.strip()
+            if not cleaned:
+                continue
+            entry = {"text": cleaned, "bbox": None}
+            if self._looks_like_table(cleaned):
+                page_payload["tables"].append(entry)
+            elif self._looks_like_formula(cleaned):
+                page_payload["formulas"].append(entry)
+            else:
+                page_payload["text_spans"].append(entry)
+        return self._finalize_payload(payload)
     
     def _parse_with_tika(self, doc_path: str) -> Optional[str]:
         """

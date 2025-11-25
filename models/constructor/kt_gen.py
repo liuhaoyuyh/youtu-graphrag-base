@@ -574,6 +574,38 @@ class KTBuilder:
     
     def save_graphml(self, output_path: str):
         graph_processor.save_graph(self.graph, output_path)
+
+    def _load_virtual_documents(self, corpus_path: str) -> List[Dict[str, Any]]:
+        """Load multimodal virtual documents if they exist."""
+        candidate_paths = []
+        corpus_dir = os.path.dirname(os.path.abspath(corpus_path))
+        candidate_paths.append(os.path.join(corpus_dir, "multimodal", "virtual_documents.json"))
+        candidate_paths.append(os.path.join("data", "uploaded", self.dataset_name, "multimodal", "virtual_documents.json"))
+        
+        extra_docs: List[Dict[str, Any]] = []
+        seen_assets = set()
+        for path in candidate_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load multimodal documents from {path}: {e}")
+                continue
+            for doc in data or []:
+                text = doc.get("text")
+                if not text:
+                    continue
+                asset_id = doc.get("source_asset")
+                if asset_id and asset_id in seen_assets:
+                    continue
+                extra_docs.append(doc)
+                if asset_id:
+                    seen_assets.add(asset_id)
+        if extra_docs:
+            logger.info(f"Loaded {len(extra_docs)} multimodal virtual documents for dataset {self.dataset_name}")
+        return extra_docs
     
     def build_knowledge_graph(self, corpus):
         logger.info(f"========{'Start Building':^20}========")
@@ -581,6 +613,10 @@ class KTBuilder:
         
         with open(corpus, 'r', encoding='utf-8') as f:
             documents = json_repair.load(f)
+        
+        extra_docs = self._load_virtual_documents(corpus)
+        if extra_docs:
+            documents.extend(extra_docs)
         
         self.process_all_documents(documents)
         

@@ -225,6 +225,11 @@ For advanced config and usage：[**🚀 Full Guide (English)**](FULLGUIDE.md) | 
 
 ### ⭐ **Start using Youtu-GraphRAG now and experience the intelligent question answering!** 🚀
 
+## 🧮 Multimodal MinerU Ingestion
+- Set `multimodal.enabled: true` inside `config/base_config.yaml` (or start the CLI with `--enable-multimodal`) to capture MinerU-extracted text, tables, formulas, and figures in addition to plain text. The guardrails mirror the RAG-Anything pipeline—tables become markdown summaries, formulas are wrapped as LaTeX, and figures receive lightweight captions so the existing graph constructor can stay unchanged.
+- During upload the backend writes structured assets to `data/uploaded/<dataset>/multimodal/` and appends the generated virtual chunks into the dataset corpus automatically. Assets can be inspected via `GET /api/multimodal/<dataset>` which returns the manifest plus the pseudo-documents that will enter the graph build.
+- The feature is fully optional; disabling `multimodal.enabled` reverts the ingestion path to text-only mode without touching graph construction code.
+
 
 ## 🤝 Contributing
 

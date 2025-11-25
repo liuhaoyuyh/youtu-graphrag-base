@@ -84,6 +84,11 @@ def parse_arguments():
         type=str,
         help="JSON string with configuration overrides"
     )
+    parser.add_argument(
+        "--enable-multimodal",
+        action="store_true",
+        help="Enable MinerU-based multimodal extraction for this run"
+    )
     return parser.parse_args()
 
 
@@ -562,6 +567,10 @@ if __name__ == "__main__":
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in override parameter: {e}")
             exit(1)
+    
+    if args.enable_multimodal and getattr(config, "multimodal", None):
+        config.multimodal.enabled = True
+        config.config_data.setdefault("multimodal", {})["enabled"] = True
     
     setup_environment(config)
     
